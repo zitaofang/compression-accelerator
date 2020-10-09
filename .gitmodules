@@ -1,15 +1,3 @@
-[submodule "rocket-chip"]
-	path = rocket-chip
-	url = https://github.com/ucb-bar/rocket-chip.git
-[submodule "testchipip"]
-	path = testchipip
-	url = https://github.com/ucb-bar/testchipip.git
-[submodule "barstools"]
-	path = barstools
-	url = https://github.com/ucb-bar/barstools.git
-[submodule "icenet"]
-	path = icenet
-	url = https://github.com/firesim/icenet
 [submodule "tests/snappy"]
 	path = tests/snappy
 	url = https://github.com/google/snappy
