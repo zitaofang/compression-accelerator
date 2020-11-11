@@ -1,4 +1,4 @@
-package example
+package snappyaccl
 
 import chisel3.iotesters.{ChiselFlatSpec, Driver, PeekPokeTester}
 

@@ -1,4 +1,4 @@
-package example
+package snappyaccl
 
 import chisel3.{Driver => _, _}
 import chisel3.iotesters._

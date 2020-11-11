@@ -1,7 +1,6 @@
-package example
+package snappyaccl
 
 import chisel3._
-import chisel3.core.dontTouch
 import chisel3.util._
 import external.{FrontendTLB, Scratchpad}
 import freechips.rocketchip.config.Parameters

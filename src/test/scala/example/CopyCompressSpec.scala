@@ -1,4 +1,4 @@
-package example
+package snappyaccl
 
 import org.scalatest.{FlatSpec, Matchers}
 import scala.math._

@@ -1,4 +1,4 @@
-package example
+package snappyaccl
 
 import chisel3._
 import freechips.rocketchip.amba.axi4._

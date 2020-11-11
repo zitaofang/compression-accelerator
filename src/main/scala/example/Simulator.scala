@@ -1,4 +1,4 @@
-package example
+package snappyaccl
 
 import java.io.File
 

@@ -1,4 +1,4 @@
-package example
+package snappyaccl
 
 import chisel3._
 import chisel3.core.dontTouch
