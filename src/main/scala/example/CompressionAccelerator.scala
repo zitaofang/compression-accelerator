@@ -64,6 +64,7 @@ class CompressionAcceleratorModule(outer: CompressionAccelerator, params: Compre
     // hold the source and destination addresses for the compress and uncompress commands
     val src = RegInit(0.U(32.W))
     val dst = RegInit(0.U(32.W))
+    val rd  = RegInit(0.U(32.W))
 
     // drives the busy signal to tell the CPU that the accelerator is busy
     val busy = RegInit(false.B)
@@ -357,6 +358,9 @@ class CompressionAcceleratorModule(outer: CompressionAccelerator, params: Compre
 	}
 
 
+    // ****** Uncompress logic ******
+    
+
     // initialize each operation
     when(cmd.fire()) {
         when(doSetLength) {
@@ -370,6 +374,7 @@ class CompressionAcceleratorModule(outer: CompressionAccelerator, params: Compre
             busy := true.B
             src := cmd.bits.rs1
             dst := cmd.bits.rs2
+            rd := cmd.bits.inst.rd
             streamCounter := 0.U
             streamHolder.foreach(_ := 0.U)
             streamEmpty := true.B
@@ -383,6 +388,7 @@ class CompressionAcceleratorModule(outer: CompressionAccelerator, params: Compre
 			realMatchFound_prev := false.B
         }.elsewhen(doUncompress) {
             busy := true.B
+            rd := cmd.bits.inst.rd
             // ...
         }
     }
@@ -402,7 +408,7 @@ class CompressionAcceleratorModule(outer: CompressionAccelerator, params: Compre
     io.mem.req.valid := false.B
     // send response into rd
     io.resp.valid := prevBusy && !busy
-    io.resp.bits.rd := cmd.bits.inst.rd
+    io.resp.bits.rd := Mux(cmd.fire(), cmd.bits.inst.rd, rd)
     io.resp.bits.data := ((memoryctrlIO.storeSpAddr - 1.U) * 8.U) + finalSWPointerOffset
 
     // TODO: use this
