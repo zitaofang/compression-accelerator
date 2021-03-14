@@ -11,17 +11,7 @@ import chisel3.util._
 // is 32K), with highest bit as valid bits. It takes 64 cycles to complete transaction.
 // (Note that the software can start adding freq to a priority queue during DMA access)
 
-// Then, software execute an instruction to start encoding, with a pointer to the tree root.
-// [63:56] of the tree root is the symbol, [55:28] for pointer to 1's child, [27:0] to 0's child.
-// Higher 36 bits of the address is always the same. Take 256 cycles to read.
-
-// Use the "huffman decoding hardware" paper's idea and build the lookup table for encoding.
-// Encoding block for the tree: 
-// d[7] = End
-// d[5:4] = length (if a full block, = 00)
-// d[3:0] = output.
-// When we get a symbol, we check the memory region to determine the starting address, then start
-// reading the block for translation.
+// Then, software execute an instruction to start encoding.
 
 class ShiftBuffer extends Module {
     val io = IO(new Bundle {
@@ -67,29 +57,71 @@ class HuffmanEncodeRequest extends Bundle {
 }
 
 class HuffmanIO(nRows: Int) extends Bundle {
-    val tree_lut = UInt(32.W)
+    val canon_table = Input(UInt((32 - 8).W))
+    val code_table = Input(Vec(2, UInt((32 - 8).W)))
+    val table_idx_table = Input(UInt((32-8).W))
+
     val req = Flipped(Decoupled(new HuffmanEncodeRequest))
-    val sp_io = new ScratchpadReadIO(nRows, 8)
+    val sp_read = Vec(2, new ScratchpadReadIO(nRows, 8))
     val resp = Valid(UInt(8.W))
 }
+
+// New encoding & decoding design:
+// We have a canonical huffman encoding table to map the original symbol to 
+// its canonical form; if we are already canonical, skip this step.
+// (Canonical symbol: if 0 is the left branch and 1 is the right branch in the 
+// tree, the leftmost leaf node will have a canonical symbol 0. It's very similar
+// to BST rank, although this is not a BST)
+
+// We group every four bits in the encoding together. For every of the 16 entries,
+// store the max canonical symbol under the current tree. If we have a leave node,
+// set all entries representing the nonexisting children of the leave node 
+// to the canonical symbol.
+
+// The entry is 16-bit wide, the lower 8 bits store the symbol as specified above. 
+// The higher 8 bits store the table index (every table is of size 16). This keep the
+// table representation compact. If we are at a leaf node, the table index will be 0,
+// the root table. We will never go back to root table from any other table, so it's
+// used to indicate a leaf node.
+
+// Get 16 8-bit comparators. Two priority encoders, one for comparator output and one for
+// reversed output. 
+
+// Software needs to prepare the list of all symbol, in their order from left to right.
+// Calculate symbol for every layer. 
+
+// For decoding, use the 4 bits in the current group to index into the table for the 
+// next layer's table. If the next level of table is 0, return the canonical symbol.
+// We run the canonical symbol through the LUT and convert back to original symbol.
+
+// Encoding requires two 64-bit ports. 
+
+// Table format: Two 8*256 bits table for Canonical symbol translation (encode/decode).
+// A series of 8*16 tables for max canonical symbols of each branch. The higher 4
+// bits and lower 4 bits are stored separately as a 64-bit line in a larger table.
+// A series of 8*16 tables for next table index, with regular table layout. 
+// The big table should have 6 index bits (64 tables max) to fit in four table. 
 
 // Encoder for static (or generated) Huffman tree. 
 class HuffmanEncoder(nRows: Int) extends Module {
     val io = IO(new HuffmanIO(nRows))
 
     // States
+    // When we receive a start request at s_ready, read the first symbol.
+    // At s_symbol_read, convert symbol to canonical symbol and read the next symbol in.
+    // At s_lut_read, read the max canonical symbol for every 4th-gen children.
+    // At s_encode, write the 4-bit encoding to sp, read the next table index.
     val s_ready :: s_symbol_read :: s_lut_read :: s_encode :: Nil = Enum(4)
     val state_reg = RegInit(s_ready)
 
     val addr_reg = Reg(UInt(32.W))
     val len_reg = Reg(UInt(32.W))
-    val lut_idx_reg = Reg(UInt(8.W))
 
     val symbol_reg = Reg(UInt(8.W))
+    val canon_reg = Reg(UInt(8.W))
+    val table_idx_reg = Reg(UInt(8.W))
 
     val buffer = Module(new ShiftBuffer)
-
-    io.sp_io.en := state_reg =/= s_ready && state_reg =/= s_end
 
     // Output align logic
     val flush_buffer = Wire(Bool())
@@ -101,31 +133,68 @@ class HuffmanEncoder(nRows: Int) extends Module {
     buffer.io.shift_in := DontCare
     buffer.io.len_code := DontCare
 
+    // Symbol comparison logic
+    val max_symbols = Wire(UInt(128.W))
+    val max_symbols_vec = Wire(Vec(16, UInt(8.W)))
+    max_symbols_vec := max_symbols
+    val symbols_eq = Wire(Vec(16, Bool()))
+    val symbols_lt = Wire(Vec(16, Bool()))
+    for (i <- 0 until 16) {
+        symbols_eq(i) := canon_reg === max_symbols_vec(i)
+        symbols_lt(i) := canon_reg > max_symbols_vec(i)
+    }
+    val symbol_end_reg = RegNext(symbols_eq.asUInt().orR)
+    val symbol_end_left = PriorityEncoder(symbols_eq)
+    val symbol_end_right = PriorityEncoder(symbols_eq.reverse)
+    val symbol_mask_reg = RegNext(~(symbol_end_left ^ symbol_end_right))
+    val match_child_reg = RegNext(PriorityEncoder(symbols_lt))
+
     // State logic
     when (state_reg === s_ready && io.req.fire()) {
         state_reg := s_lut_read
-        addr_reg := io.req.bits.head
+        addr_reg := io.req.bits.head + 1.U
         len_reg := io.req.bits.length - 1.U
+        table_idx_reg := 0.U
+
+        io.sp_read(1).en := true.B
+        io.sp_read(1).addr := io.req.bits.head
+        symbol_reg := io.sp_read(1).data
     } 
     .elsewhen (state_reg === s_symbol_read) {
-        io.sp_io.en := true.B
-        io.sp_io.addr := addr_reg
-        symbol_reg := io.sp_io.data
         state_reg := s_lut_read
+        addr_reg := addr_reg + 1.U;
+
+        io.sp_read(1).en := len_reg === 0.U
+        io.sp_read(1).addr := addr_reg
+        symbol_reg := io.sp_read(1).data
+
+        io.sp_read(0).en := true.B
+        io.sp_read(0).addr := Cat(io.canon_table, io.symbol_reg)
+        canon_reg := io.sp_read(0).data
     }
     .elsewhen (state_reg === s_lut_read) {
-        io.sp_io.en := true.B
-        io.sp_io.addr := io.tree_lut + symbol_reg
-        lut_idx_reg := io.sp_io.data
         state_reg := s_encode
+        
+        io.sp_read(1).en := true.B
+        io.sp_read(1).addr := io.code_table(1) + table_idx_reg
+        max_symbols(127, 64) := io.sp_read(1).data
+
+        io.sp_read(0).en := true.B
+        io.sp_read(0).addr := io.code_table(0) + table_idx_reg
+        max_symbols(63, 0) := io.sp_read(0).data
     }
     .elsewhen (state_reg === s_encode) {
-        io.sp_io.en := true.B
-        io.sp_io.addr := lut_idx_reg
-
+        io.sp_read(1).en := true.B
+        io.sp_read(1).addr := Cat(io.table_idx_table, table_idx_reg, match_child_reg(3))
+        val next_table_vec = Wire(Vec(8, UInt(8.W)))
+        next_table_vec := io.sp_read(1).data
+        table_idx_reg := next_table_vec(match_child_reg(2, 0))
+        
         buffer.io.in_en := true.B
+        buffer.io.shift_in := match_child_reg
         // If we reach the end of the block...
-        when (io.sp_io.data(7)) {
+        when (symbol_end_reg) {
+            buffer.io.len_code := PriorityEncoder(symbol_mask_reg)
             // If we also reach the end of the request...
             when (len_reg === 0.U) {
                 // Go back to ready state and flush the buffer
@@ -139,35 +208,26 @@ class HuffmanEncoder(nRows: Int) extends Module {
             }
         } .otherwise {
             // If not, continue to read
-            buffer.io.shift_in := io.sp_io.data(3, 0)
             buffer.io.len_code := 0.U
-            lut_idx_reg := lut_idx_reg + 1.U
         }
     }
 }
 
-// Huffman tree walker. Read the tree in the memory and load them into scratchpad for encoding.
-class HuffmanEncodingWalker(nRows: Int) extends Module {
-    val io = IO(new Bundle {
-        val sp_read = new ScratchpadReadIO(nRows, 8)
-        val sp_write = new ScratchpadReadIO(nRows, 8)
-        val stack_bottom = Input(sp_read.addr.cloneType)
-        val tree_root = Input(sp_write.addr.cloneType)
-        val tree_root = Input(sp_write.addr.cloneType)
-    })
-
-    // To avoid the stack consuming too much memory when traversing a extremely deep branch,
-    // we will only search down for 4 level at a time. We will stop the search and store it
-    // to a queue at level 4 if there are still more nodes under it. The queue start at 
-    // (stack_bottom + 32 (# of possible entry) * 4 (entry length)).
-}
-
-// Huffman tree walker. Convert Huffman tree in compressed stream to the decoding format.
-class HuffmanDecodingWalker extends Module {
-
-}
-
-// Huffman tree decoder.
+// Huffman tree decoder
 class HuffmanDecoder extends Module {
+    val io = IO(new HuffmanIO)
+
+    val s_ready :: s_busy :: Nil = Enum(2)
+    val state_reg = RegInit(s_ready)
+
+    val addr_reg = Reg(UInt(32.W))
+    val len_reg = Reg(UInt(32.W))
+    val table_idx_reg = Reg(UInt(4.W))
     
+    when (state_reg === s_ready && io.req.fire()) {
+        state_reg := s_busy
+        table_idx_reg := 0.U
+    } .elsewhen (state_reg === s_busy) {
+        
+    }
 }
