@@ -13,7 +13,7 @@ import chisel3.util._
 
 // Then, software execute an instruction to start encoding.
 
-class ShiftBuffer extends Module {
+class EncodeShiftBuffer extends Module {
     val io = IO(new Bundle {
         val flush = Input(Bool())
         val in_en = Input(Bool())
@@ -59,7 +59,7 @@ class HuffmanEncodeRequest extends Bundle {
 class HuffmanIO(nRows: Int) extends Bundle {
     val canon_table = Input(UInt((32 - 8).W))
     val code_table = Input(Vec(2, UInt((32 - 8).W)))
-    val table_idx_table = Input(UInt((32-8).W))
+    val table_idx_table = Input(UInt((32 - 8 - 1).W))
 
     val req = Flipped(Decoupled(new HuffmanEncodeRequest))
     val sp_read = Vec(2, new ScratchpadReadIO(nRows, 8))
@@ -114,6 +114,12 @@ class HuffmanEncoder(nRows: Int) extends Module {
     val s_ready :: s_symbol_read :: s_lut_read :: s_encode :: Nil = Enum(4)
     val state_reg = RegInit(s_ready)
 
+    io.req.ready := state_reg === s_ready
+    io.sp_read(1).en := false.B
+    io.sp_read(1).addr := DontCare
+    io.sp_read(0).en := false.B
+    io.sp_read(0).addr := DontCare
+
     val addr_reg = Reg(UInt(32.W))
     val len_reg = Reg(UInt(32.W))
 
@@ -121,7 +127,7 @@ class HuffmanEncoder(nRows: Int) extends Module {
     val canon_reg = Reg(UInt(8.W))
     val table_idx_reg = Reg(UInt(8.W))
 
-    val buffer = Module(new ShiftBuffer)
+    val buffer = Module(new EncodeShiftBuffer)
 
     // Output align logic
     val flush_buffer = Wire(Bool())
@@ -176,11 +182,11 @@ class HuffmanEncoder(nRows: Int) extends Module {
         state_reg := s_encode
         
         io.sp_read(1).en := true.B
-        io.sp_read(1).addr := io.code_table(1) + table_idx_reg
+        io.sp_read(1).addr := Cat(io.code_table(1), table_idx_reg)
         max_symbols(127, 64) := io.sp_read(1).data
 
         io.sp_read(0).en := true.B
-        io.sp_read(0).addr := io.code_table(0) + table_idx_reg
+        io.sp_read(0).addr := Cat(io.code_table(0), table_idx_reg)
         max_symbols(63, 0) := io.sp_read(0).data
     }
     .elsewhen (state_reg === s_encode) {
@@ -213,21 +219,108 @@ class HuffmanEncoder(nRows: Int) extends Module {
     }
 }
 
+class DecodeShiftBuffer extends Module {
+    val io = IO(new Bundle {
+        val flush = Input(Bool())
+        val refill = Flipped(Decoupled(UInt(8.W)))
+        val shift = Input(UInt(3.W))
+        val out = Valid(UInt(4.W))
+    })
+
+    val buffer_reg = Reg(UInt(16.W))
+    val valid_reg = RegInit(0.U(16.W))
+    
+    io.out.valid := valid_reg(15, 12).andR
+    io.out.bits := buffer_reg(15, 12)
+
+    val shifted_buffer = buffer_reg << io.shift
+    val shifted_valid = valid_reg << io.shift
+    val shamt = PriorityEncoder(Reverse(shifted_valid(15, 8)))
+    io.refill.ready := ~shifted_valid(7, 0).andR
+    valid_reg := Cat(Fill(8, io.refill.fire()), 0.U(8.W)) >> shamt
+    buffer_reg := shifted_buffer | Cat(io.refill.bits, 0.U(8.W)) >> shamt
+}
+
 // Huffman tree decoder
 class HuffmanDecoder extends Module {
-    val io = IO(new HuffmanIO)
+    val io = IO(new HuffmanIO(32))
 
     val s_ready :: s_busy :: Nil = Enum(2)
     val state_reg = RegInit(s_ready)
 
     val addr_reg = Reg(UInt(32.W))
     val len_reg = Reg(UInt(32.W))
-    val table_idx_reg = Reg(UInt(4.W))
+    val table_idx_reg = Reg(UInt(8.W))
     
+    io.sp_read(1).en := false.B
+    io.sp_read(1).addr := DontCare
+    io.sp_read(0).en := false.B
+    io.sp_read(0).addr := DontCare
+    io.resp.valid := false.B
+    io.resp.bits := DontCare
+    val buffer = Module(new DecodeShiftBuffer)
+    buffer.io.flush := false.B
+    buffer.io.shift := 0.U
+    buffer.io.refill.valid := false.B
+    buffer.io.refill.bits := DontCare
+
     when (state_reg === s_ready && io.req.fire()) {
         state_reg := s_busy
+        addr_reg := io.req.bits.head
+        len_reg := io.req.bits.length - 1.U
         table_idx_reg := 0.U
     } .elsewhen (state_reg === s_busy) {
-        
+        // If the buffer needs refill, refill it during this cycle
+        when (buffer.io.refill.ready) {
+            buffer.io.refill.valid := true.B
+            io.sp_read(1).en := true.B
+            io.sp_read(1).addr := addr_reg
+            buffer.io.refill.bits := io.sp_read(1).data
+            addr_reg := addr_reg + 1.U
+        } .otherwise {
+            // When busy, we read four bits from the buffer and look at the table.
+            // Port 1 read the next table index, and port 0 read the max symbol. 
+            // If port 1 indicates that this is a leaf, we will compare the max symbol 
+            // in the current position with all other max symbol in port 0 to determine
+            // the # of bits remaining in this leaf.
+            // We send the bits info into the shift buffer. 
+            io.sp_read(1).en := true.B
+            io.sp_read(1).addr := Cat(io.table_idx_table, table_idx_reg, buffer.io.out.bits(3))
+            val next_table_vec = Wire(Vec(8, UInt(8.W)))
+            next_table_vec := io.sp_read(1).data
+            val next_idx = next_table_vec(buffer.io.out.bits(2, 0))
+
+            io.sp_read(0).en := true.B
+            io.sp_read(0).addr := Cat(io.canon_table(buffer.io.out.bits(3)), table_idx_reg)
+            val max_symbol_vec = Vec(8, UInt(8.W))
+            max_symbol_vec := io.sp_read(0).data
+
+            val max_symbol = max_symbol_vec(buffer.io.out.bits(2, 0))
+            val max_symbol_eq_b0 = VecInit(max_symbol_vec map (max_symbol === _))
+            val max_symbol_eq_b1 = VecInit(((max_symbol_eq_b0 grouped 2) map { a => a(1) && a(0) }).toSeq)
+            val max_symbol_eq_b2 = VecInit(((max_symbol_eq_b1 grouped 2) map { a => a(1) && a(0) }).toSeq)
+            val max_symbol_eq_b3 = max_symbol_eq_b2(1) && max_symbol_eq_b2(0)
+
+            val symbol_mask = Cat(max_symbol_eq_b3, max_symbol_eq_b2(buffer.io.out.bits(2)),
+                max_symbol_eq_b1(buffer.io.out.bits(2, 1)), max_symbol_eq_b0(buffer.io.out.bits(2, 0)))
+            val symbol_shift = PriorityEncoder(Reverse(symbol_mask)) +& 1.U
+
+            when (buffer.io.out.valid) {
+                table_idx_reg := next_idx
+                when (next_idx === 0.U) {
+                    buffer.io.shift := symbol_shift
+                    io.resp.valid := true.B
+                    io.resp.bits := max_symbol
+                    when (len_reg === 0.U) {
+                        buffer.io.flush := true.B
+                        state_reg := s_ready
+                    } .otherwise {
+                        len_reg := len_reg - 1.U
+                    }
+                } .otherwise {
+                    buffer.io.shift := 4.U
+                }
+            }
+        }
     }
 }
